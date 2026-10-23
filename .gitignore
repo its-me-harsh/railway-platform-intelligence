@@ -1,0 +1,29 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+venv*/
+.pytest_cache/
+
+# Local data and trained artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+model_metadata.json
+
+# Frontend dependencies/build
+frontend/node_modules/
+frontend/dist/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

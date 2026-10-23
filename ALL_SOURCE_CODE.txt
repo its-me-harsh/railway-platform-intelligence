@@ -1,0 +1,622 @@
+RAILWAY PLATFORM LIVE API & PREDICTIVE ANALYTICS — SOURCE BUNDLE
+This file combines the source files for reference. For running the project, use the ZIP's folder structure.
+
+==========================================================================================
+FILE: .env.example
+==========================================================================================
+RAILRADAR_BASE_URL=https://api.railradar.in/v1
+RAILRADAR_API_KEY=
+# Optional. Set only if you have the correct provider URL template.
+# It must contain {station} and {platform}; the backend will append no extra path.
+PLATFORM_API_URL_TEMPLATE=
+DATABASE_PATH=railway_history.db
+MODEL_PATH=railway_delay_model.pkl
+MODEL_METADATA_PATH=model_metadata.json
+DEFAULT_STATIONS=NDLS:4,ANVT:1
+COLLECTION_INTERVAL_SECONDS=7200
+CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+
+==========================================================================================
+FILE: requirements.txt
+==========================================================================================
+fastapi>=0.110
+uvicorn[standard]>=0.27
+requests>=2.31
+python-dotenv>=1.0
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+joblib>=1.3
+
+==========================================================================================
+FILE: database.py
+==========================================================================================
+import json
+import os
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+DB_PATH = os.getenv("DATABASE_PATH", "railway_history.db")
+
+def connect():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True) if Path(DB_PATH).parent != Path(".") else None
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS train_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                collected_at TEXT NOT NULL,
+                station_code TEXT,
+                platform_number INTEGER,
+                train_number TEXT,
+                train_name TEXT,
+                status TEXT,
+                delay_minutes REAL,
+                current_station TEXT,
+                next_station TEXT,
+                distance_to_next_km REAL,
+                payload_json TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_station_platform ON train_history(station_code, platform_number)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_train_time ON train_history(train_number, collected_at)")
+        conn.commit()
+
+def _number(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+def _first(d, *keys):
+    if not isinstance(d, dict):
+        return None
+    for key in keys:
+        val = d.get(key)
+        if val is not None:
+            return val
+    return None
+
+def save_snapshot(data, station_code=None, platform_number=None):
+    """Save a raw provider payload or normalized platform response."""
+    init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    trains = data.get("trains") if isinstance(data, dict) else None
+    if not isinstance(trains, list):
+        # A live train payload may itself describe one train.
+        trains = [data] if isinstance(data, dict) else []
+    saved = 0
+    with connect() as conn:
+        for train in trains:
+            if not isinstance(train, dict):
+                continue
+            train_number = _first(train, "train_number", "trainNumber", "number", "train_no")
+            train_name = _first(train, "train_name", "trainName", "name")
+            status = _first(train, "status", "running_status", "runningStatus")
+            delay = _number(_first(train, "delay_minutes", "delayMinutes", "delay", "late_by"))
+            current = _first(train, "current_station", "currentStation", "current_location", "currentLocation")
+            nxt = _first(train, "next_station", "nextStation", "next_stop")
+            distance = _number(_first(train, "distance_to_next_km", "distanceToNextStationKm", "distance_to_next_station_km"))
+            conn.execute("""
+                INSERT INTO train_history
+                (collected_at, station_code, platform_number, train_number, train_name, status,
+                 delay_minutes, current_station, next_station, distance_to_next_km, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (now, station_code, platform_number, str(train_number) if train_number is not None else None,
+                  str(train_name) if train_name is not None else None, str(status) if status is not None else None,
+                  delay, str(current) if current is not None else None, str(nxt) if nxt is not None else None,
+                  distance, json.dumps(train, ensure_ascii=False)))
+            saved += 1
+        conn.commit()
+    return saved
+
+def recent_history(station=None, platform=None, train_number=None, limit=100):
+    init_db()
+    query = "SELECT * FROM train_history WHERE 1=1"
+    args = []
+    if station:
+        query += " AND station_code = ?"; args.append(station.upper())
+    if platform is not None:
+        query += " AND platform_number = ?"; args.append(int(platform))
+    if train_number:
+        query += " AND train_number = ?"; args.append(str(train_number))
+    query += " ORDER BY id DESC LIMIT ?"; args.append(max(1, min(int(limit), 1000)))
+    with connect() as conn:
+        rows = conn.execute(query, args).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try: item["payload"] = json.loads(item.pop("payload_json"))
+        except Exception: item["payload"] = item.pop("payload_json", None)
+        result.append(item)
+    return result
+
+==========================================================================================
+FILE: backend.py
+==========================================================================================
+import json
+import os
+from pathlib import Path
+from typing import Optional
+import joblib
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from database import init_db, save_snapshot, recent_history
+
+load_dotenv()
+BASE_URL = os.getenv("RAILRADAR_BASE_URL", "https://api.railradar.in/v1").rstrip("/")
+API_KEY = os.getenv("RAILRADAR_API_KEY", "").strip()
+PLATFORM_TEMPLATE = os.getenv("PLATFORM_API_URL_TEMPLATE", "").strip()
+MODEL_PATH = os.getenv("MODEL_PATH", "railway_delay_model.pkl")
+TIMEOUT = 20
+
+app = FastAPI(title="Railway Platform Live API", version="1.0.0")
+origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=origins or ["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+def provider_get(url):
+    headers = {"Accept": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+        headers["x-api-key"] = API_KEY
+    try:
+        response = requests.get(url, headers=headers, timeout=TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Railway data provider request failed: {exc}")
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Railway data provider returned invalid JSON")
+
+def unwrap(data):
+    """Handle common API response envelopes without assuming one exact schema."""
+    if not isinstance(data, dict):
+        return data
+    for key in ("data", "result", "response"):
+        value = data.get(key)
+        if isinstance(value, (dict, list)):
+            return value
+    return data
+
+def train_list(data):
+    data = unwrap(data)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("trains", "results", "items", "data"):
+            if isinstance(data.get(key), list):
+                return data[key]
+    return []
+
+def find_value(obj, *keys):
+    if not isinstance(obj, dict):
+        return None
+    for key in keys:
+        if obj.get(key) is not None:
+            return obj[key]
+    return None
+
+@app.get("/")
+def root():
+    return {"success": True, "message": "Railway Platform Live API is running"}
+
+@app.get("/api/stations/{station_code}/platform/{platform_number}")
+def platform_trains(station_code: str, platform_number: int):
+    station = station_code.upper()
+    if PLATFORM_TEMPLATE:
+        url = PLATFORM_TEMPLATE.format(station=station, platform=platform_number)
+        data = provider_get(url)
+        data = unwrap(data)
+        trains = train_list(data)
+        response = {"success": True, "station": station, "platform": platform_number,
+                    "train_count": len(trains), "trains": trains, "source": "provider"}
+        save_snapshot(response, station, platform_number)
+        return response
+    # Safe fallback: return what has actually been collected, not fabricated live trains.
+    rows = recent_history(station=station, platform=platform_number, limit=100)
+    latest_by_train = {}
+    for row in rows:
+        key = row.get("train_number") or f"unknown-{row['id']}"
+        latest_by_train.setdefault(key, row)
+    trains = []
+    for row in latest_by_train.values():
+        payload = row.get("payload") or {}
+        if isinstance(payload, dict):
+            item = dict(payload)
+            item.setdefault("train_number", row.get("train_number"))
+            item.setdefault("train_name", row.get("train_name"))
+            item.setdefault("status", row.get("status"))
+            item.setdefault("delay_minutes", row.get("delay_minutes"))
+            trains.append(item)
+    return {"success": True, "station": station, "platform": platform_number,
+            "train_count": len(trains), "trains": trains, "source": "local_history",
+            "notice": "Configure PLATFORM_API_URL_TEMPLATE for provider live platform data."}
+
+@app.get("/api/trains/{train_number}/live")
+def train_live(train_number: str):
+    data = provider_get(f"{BASE_URL}/trains/{train_number}/live")
+    return {"success": True, "train_number": train_number, "data": unwrap(data)}
+
+@app.get("/api/trains/{train_number}/intelligence")
+def train_intelligence(train_number: str):
+    raw = unwrap(provider_get(f"{BASE_URL}/trains/{train_number}/live"))
+    if not isinstance(raw, dict):
+        raw = {"raw": raw}
+    route = find_value(raw, "route", "stations", "stops") or []
+    current = find_value(raw, "current_location", "currentLocation", "current_station", "currentStation", "current")
+    previous = find_value(raw, "previous_station", "previousStation", "last_station", "lastStation")
+    nxt = find_value(raw, "next_station", "nextStation", "next_stop", "nextStop")
+    delay = find_value(raw, "delay_minutes", "delayMinutes", "delay", "late_by")
+    return {
+        "success": True,
+        "train_number": str(find_value(raw, "train_number", "trainNumber", "number") or train_number),
+        "train_name": find_value(raw, "train_name", "trainName", "name"),
+        "status": find_value(raw, "status", "running_status", "runningStatus"),
+        "is_live": True,
+        "from": find_value(raw, "from", "source", "origin"),
+        "to": find_value(raw, "to", "destination", "dest"),
+        "current_location": current,
+        "previous_station": previous,
+        "next_station": nxt,
+        "delay_minutes": delay,
+        "route_stop_count": len(route) if isinstance(route, list) else None,
+        "last_updated": find_value(raw, "last_updated", "lastUpdated", "updated_at", "updatedAt"),
+        "raw": raw
+    }
+
+@app.get("/api/history")
+def history(station: Optional[str] = None, platform: Optional[int] = None,
+            train_number: Optional[str] = None, limit: int = Query(100, ge=1, le=1000)):
+    rows = recent_history(station=station, platform=platform, train_number=train_number, limit=limit)
+    return {"success": True, "count": len(rows), "records": rows}
+
+@app.post("/api/collect")
+def collect(station: str = Query(..., min_length=2), platform: int = Query(..., ge=1)):
+    station = station.upper()
+    if not PLATFORM_TEMPLATE:
+        raise HTTPException(status_code=503, detail="Set PLATFORM_API_URL_TEMPLATE in .env to enable provider platform collection.")
+    url = PLATFORM_TEMPLATE.format(station=station, platform=platform)
+    data = unwrap(provider_get(url))
+    trains = train_list(data)
+    saved = save_snapshot({"trains": trains}, station, platform)
+    return {"success": True, "station": station, "platform": platform,
+            "train_count": len(trains), "records_saved": saved, "trains": trains}
+
+@app.get("/api/trains/{train_number}/prediction")
+def predict_delay(train_number: str):
+    if not Path(MODEL_PATH).exists():
+        raise HTTPException(status_code=503, detail="Model not found. Collect historical data and run: python train_model.py")
+    try:
+        bundle = joblib.load(MODEL_PATH)
+        model = bundle["model"]
+        features = bundle["features"]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not load model bundle: {exc}")
+    rows = recent_history(train_number=train_number, limit=1)
+    if not rows:
+        raise HTTPException(status_code=404, detail="No historical snapshot exists for this train yet.")
+    row = rows[0]
+    # The baseline feature set is intentionally explicit and robust to missing fields.
+    feature_values = {
+        "platform_number": row.get("platform_number"),
+        "delay_minutes": row.get("delay_minutes"),
+        "distance_to_next_km": row.get("distance_to_next_km"),
+        "station_code_NDLS": 1 if row.get("station_code") == "NDLS" else 0,
+        "station_code_ANVT": 1 if row.get("station_code") == "ANVT" else 0,
+    }
+    import pandas as pd
+    x = pd.DataFrame([{f: feature_values.get(f, 0) for f in features}])
+    prediction = float(model.predict(x)[0])
+    return {"success": True, "train_number": train_number,
+            "predicted_delay_minutes": round(prediction, 2),
+            "model": "trained scikit-learn model",
+            "note": "Experimental estimate from historical observations; not an official ETA."}
+
+==========================================================================================
+FILE: collector.py
+==========================================================================================
+import os
+import time
+import requests
+from dotenv import load_dotenv
+from database import save_snapshot
+
+load_dotenv()
+TEMPLATE = os.getenv("PLATFORM_API_URL_TEMPLATE", "").strip()
+INTERVAL = int(os.getenv("COLLECTION_INTERVAL_SECONDS", "7200"))
+BASE_URL = os.getenv("RAILRADAR_BASE_URL", "https://api.railradar.in/v1").rstrip("/")
+API_KEY = os.getenv("RAILRADAR_API_KEY", "").strip()
+STATIONS = os.getenv("DEFAULT_STATIONS", "NDLS:4,ANVT:1")
+
+def fetch(url):
+    headers = {"Accept": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+        headers["x-api-key"] = API_KEY
+    response = requests.get(url, headers=headers, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+def unwrap(data):
+    if isinstance(data, dict):
+        for k in ("data", "result", "response"):
+            if isinstance(data.get(k), (dict, list)):
+                return data[k]
+    return data
+
+def get_trains(data):
+    data = unwrap(data)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("trains", "results", "items"):
+            if isinstance(data.get(k), list):
+                return data[k]
+    return []
+
+def main():
+    if not TEMPLATE:
+        raise SystemExit("Set PLATFORM_API_URL_TEMPLATE in .env to your valid provider platform endpoint.")
+    pairs = []
+    for token in STATIONS.split(","):
+        if ":" in token:
+            station, platform = token.strip().split(":", 1)
+            pairs.append((station.upper(), int(platform)))
+    print(f"Collector running for {pairs}; interval={INTERVAL}s. Ctrl+C to stop.")
+    while True:
+        for station, platform in pairs:
+            try:
+                url = TEMPLATE.format(station=station, platform=platform)
+                trains = get_trains(fetch(url))
+                saved = save_snapshot({"trains": trains}, station, platform)
+                print(f"{station} platform {platform}: {len(trains)} trains, saved {saved}")
+            except Exception as exc:
+                print(f"Collection failed for {station}/{platform}: {exc}")
+        time.sleep(max(60, INTERVAL))
+
+if __name__ == "__main__":
+    main()
+
+==========================================================================================
+FILE: train_model.py
+==========================================================================================
+import json
+import os
+import sqlite3
+from pathlib import Path
+import joblib
+import pandas as pd
+from dotenv import load_dotenv
+from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+load_dotenv()
+DB_PATH = os.getenv("DATABASE_PATH", "railway_history.db")
+MODEL_PATH = os.getenv("MODEL_PATH", "railway_delay_model.pkl")
+META_PATH = os.getenv("MODEL_METADATA_PATH", "model_metadata.json")
+FEATURES = ["platform_number", "distance_to_next_km", "station_code_NDLS", "station_code_ANVT"]
+
+def main():
+    if not Path(DB_PATH).exists():
+        raise SystemExit(f"Database not found: {DB_PATH}. Run the backend/collector first.")
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql_query("""
+            SELECT collected_at, station_code, platform_number, delay_minutes, distance_to_next_km
+            FROM train_history
+            WHERE delay_minutes IS NOT NULL
+            ORDER BY collected_at ASC
+        """, conn)
+    if len(df) < 20:
+        raise SystemExit(f"Only {len(df)} labeled rows found. Collect at least 20; preferably hundreds across different trains and times.")
+    df["station_code_NDLS"] = (df["station_code"] == "NDLS").astype(int)
+    df["station_code_ANVT"] = (df["station_code"] == "ANVT").astype(int)
+    for col in FEATURES:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[FEATURES] = df[FEATURES].fillna(0)
+    X, y = df[FEATURES], pd.to_numeric(df["delay_minutes"], errors="coerce")
+    valid = y.notna()
+    X, y = X.loc[valid], y.loc[valid]
+    split = max(1, int(len(X) * 0.8))
+    if len(X) - split < 1:
+        split = len(X) - 1
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
+    model = ExtraTreesRegressor(n_estimators=250, random_state=42, min_samples_leaf=2)
+    model.fit(X_train, y_train)
+    predictions = model.predict(X_test)
+    metrics = {
+        "rows": int(len(df)),
+        "train_rows": int(len(X_train)),
+        "test_rows": int(len(X_test)),
+        "mae_minutes": round(float(mean_absolute_error(y_test, predictions)), 3),
+        "rmse_minutes": round(float(mean_squared_error(y_test, predictions) ** 0.5), 3),
+        "r2": round(float(r2_score(y_test, predictions)), 3) if len(y_test) >= 2 else None,
+        "features": FEATURES,
+        "warning": "Chronological holdout is only a first check. Sparse or biased historical data can make metrics unstable."
+    }
+    joblib.dump({"model": model, "features": FEATURES}, MODEL_PATH)
+    Path(META_PATH).write_text(json.dumps(metrics, indent=2))
+    print(json.dumps(metrics, indent=2))
+    print(f"Saved model: {MODEL_PATH}")
+
+if __name__ == "__main__":
+    main()
+
+==========================================================================================
+FILE: frontend/vite.config.js
+==========================================================================================
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+export default defineConfig({ plugins: [react()], server: { port: 5173 } });
+
+==========================================================================================
+FILE: frontend/src/main.jsx
+==========================================================================================
+import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App.jsx";
+import "./style.css";
+createRoot(document.getElementById("root")).render(<React.StrictMode><App /></React.StrictMode>);
+
+==========================================================================================
+FILE: frontend/src/App.jsx
+==========================================================================================
+import { useCallback, useEffect, useState } from "react";
+
+const API = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+
+export default function App() {
+  const [station, setStation] = useState("NDLS");
+  const [platform, setPlatform] = useState("4");
+  const [trainNumber, setTrainNumber] = useState("12616");
+  const [data, setData] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [intelligence, setIntelligence] = useState(null);
+  const [prediction, setPrediction] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [updatedAt, setUpdatedAt] = useState(null);
+
+  const loadPlatform = useCallback(async () => {
+    setBusy(true); setError("");
+    try {
+      const [platformRes, historyRes] = await Promise.all([
+        fetch(`${API}/api/stations/${encodeURIComponent(station)}/platform/${encodeURIComponent(platform)}`),
+        fetch(`${API}/api/history?station=${encodeURIComponent(station)}&platform=${encodeURIComponent(platform)}&limit=30`)
+      ]);
+      const platformJson = await platformRes.json();
+      const historyJson = await historyRes.json();
+      if (!platformRes.ok) throw new Error(platformJson.detail || "Unable to load platform trains.");
+      setData(platformJson);
+      setHistory(historyJson.records || []);
+      setUpdatedAt(new Date());
+    } catch (e) {
+      setError(`${e.message}. Check that the backend is running at ${API}.`);
+    } finally { setBusy(false); }
+  }, [station, platform]);
+
+  const loadTrain = async () => {
+    setError(""); setIntelligence(null); setPrediction(null);
+    try {
+      const res = await fetch(`${API}/api/trains/${encodeURIComponent(trainNumber)}/intelligence`);
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.detail || "Unable to load train intelligence.");
+      setIntelligence(json);
+      const pRes = await fetch(`${API}/api/trains/${encodeURIComponent(trainNumber)}/prediction`);
+      const pJson = await pRes.json();
+      if (pRes.ok) setPrediction(pJson);
+      else setPrediction({ error: pJson.detail || "Prediction is not available yet." });
+    } catch (e) { setError(e.message); }
+  };
+
+  useEffect(() => { loadPlatform(); }, [loadPlatform]);
+  useEffect(() => {
+    const id = setInterval(loadPlatform, 60000);
+    return () => clearInterval(id);
+  }, [loadPlatform]);
+
+  const trains = data?.trains || [];
+  const get = (obj, ...keys) => {
+    for (const key of keys) if (obj?.[key] !== undefined && obj?.[key] !== null) return obj[key];
+    return "—";
+  };
+
+  return <main className="shell">
+    <header className="topbar">
+      <div className="brand"><div className="brand-icon">↗</div><div><div className="eyebrow">LIVE • ML • ANALYTICS</div><h1>Railway Intelligence</h1></div></div>
+      <div className="live-pill"><span /> System dashboard</div>
+    </header>
+
+    <section className="hero">
+      <div><p className="eyebrow">OPERATIONAL OVERVIEW</p><h2>Know what’s moving.<br/><span>Understand what’s next.</span></h2>
+      <p className="muted">Live train data, collected history, and experimental delay predictions in one place.</p></div>
+      <div className="hero-mark">🚆</div>
+    </section>
+
+    <section className="controls panel">
+      <div className="section-heading"><div><p className="eyebrow">PLATFORM MONITOR</p><h3>Trains at a glance</h3></div>
+        <button className="secondary" onClick={loadPlatform} disabled={busy}>{busy ? "Refreshing…" : "↻ Refresh"}</button></div>
+      <div className="form-row">
+        <label>Station code<input value={station} onChange={e => setStation(e.target.value.toUpperCase())} placeholder="NDLS"/></label>
+        <label>Platform<input type="number" min="1" value={platform} onChange={e => setPlatform(e.target.value)}/></label>
+        <button onClick={loadPlatform}>Load platform</button>
+      </div>
+      <div className="stats">
+        <div className="stat"><span>Trains returned</span><strong>{data?.train_count ?? "—"}</strong></div>
+        <div className="stat"><span>Data source</span><strong className="small-strong">{data?.source === "provider" ? "Provider live" : data?.source === "local_history" ? "Local history" : "—"}</strong></div>
+        <div className="stat"><span>Last refreshed</span><strong className="small-strong">{updatedAt ? updatedAt.toLocaleTimeString() : "—"}</strong></div>
+      </div>
+      {data?.notice && <p className="notice">{data.notice}</p>}
+      {error && <p className="error">{error}</p>}
+      <div className="train-grid">
+        {trains.map((train, i) => <article className="train-card" key={`${get(train,"train_number","trainNumber","number")}-${i}`}>
+          <div className="train-card-top"><span className="train-symbol">🚆</span><span className="badge">{get(train,"status","running_status","runningStatus")}</span></div>
+          <h4>{get(train,"train_name","trainName","name")}</h4>
+          <p className="muted">Train #{get(train,"train_number","trainNumber","number")}</p>
+          <div className="train-meta"><span>Delay</span><strong>{get(train,"delay_minutes","delayMinutes","delay")} min</strong></div>
+          <div className="train-meta"><span>Next station</span><strong>{get(train,"next_station","nextStation","next_stop")}</strong></div>
+        </article>)}
+        {!trains.length && !busy && <div className="empty"><strong>No train records to display</strong><p>Configure a provider platform endpoint or run the collector to populate local history.</p></div>}
+      </div>
+    </section>
+
+    <section className="two-col">
+      <div className="panel">
+        <p className="eyebrow">TRAIN INTELLIGENCE</p><h3>Inspect a train</h3>
+        <div className="form-row train-search"><label>Train number<input value={trainNumber} onChange={e => setTrainNumber(e.target.value)} placeholder="12616"/></label><button onClick={loadTrain}>Analyze train</button></div>
+        {intelligence && <div className="intel">
+          <h4>{intelligence.train_name || `Train ${intelligence.train_number}`}</h4>
+          <p className="muted">#{intelligence.train_number} · {intelligence.status || "Status unavailable"}</p>
+          <div className="detail-grid">
+            <div><span>Current location</span><strong>{typeof intelligence.current_location === "object" ? JSON.stringify(intelligence.current_location) : intelligence.current_location || "—"}</strong></div>
+            <div><span>Previous station</span><strong>{typeof intelligence.previous_station === "object" ? JSON.stringify(intelligence.previous_station) : intelligence.previous_station || "—"}</strong></div>
+            <div><span>Next station</span><strong>{typeof intelligence.next_station === "object" ? JSON.stringify(intelligence.next_station) : intelligence.next_station || "—"}</strong></div>
+            <div><span>Current delay</span><strong>{intelligence.delay_minutes ?? "—"} min</strong></div>
+          </div>
+          {prediction && <div className="prediction"><span>Experimental predicted delay</span><strong>{prediction.predicted_delay_minutes !== undefined ? `${prediction.predicted_delay_minutes} min` : "Unavailable"}</strong><small>{prediction.note || prediction.error}</small></div>}
+        </div>}
+        {!intelligence && <p className="muted helper">Enter a train number to load live intelligence and an available model prediction.</p>}
+      </div>
+      <div className="panel">
+        <p className="eyebrow">HISTORICAL STORAGE</p><h3>Recent observations</h3>
+        <p className="muted">Latest stored snapshots for {station || "selected station"} · Platform {platform || "—"}</p>
+        <div className="history-list">
+          {history.slice(0, 8).map(row => <div className="history-row" key={row.id}><div><strong>{row.train_name || `Train ${row.train_number || "—"}`}</strong><small>{row.train_number || "No number"} · {row.collected_at ? new Date(row.collected_at).toLocaleString() : "Time unavailable"}</small></div><span>{row.delay_minutes == null ? "—" : `${row.delay_minutes} min`}</span></div>)}
+          {!history.length && <div className="empty compact">No stored observations yet.</div>}
+        </div>
+      </div>
+    </section>
+    <footer>Railway Intelligence · Prototype dashboard · Predictions are experimental and not official railway information.</footer>
+  </main>;
+}
+
+==========================================================================================
+FILE: frontend/src/style.css
+==========================================================================================
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+:root{font-family:'DM Sans',sans-serif;color:#e8eef8;background:#080e19;font-synthesis:none;text-rendering:optimizeLegibility}
+*{box-sizing:border-box}body{margin:0;min-width:320px;background:radial-gradient(ellipse at 80% 0%,#172641 0%,#080e19 45%);min-height:100vh}
+button,input{font:inherit}button{cursor:pointer;border:0;border-radius:11px;padding:12px 16px;background:#b7f36b;color:#10180a;font-weight:700;transition:transform .15s,opacity .15s}button:hover{transform:translateY(-1px)}button:disabled{opacity:.6;cursor:wait}
+.shell{max-width:1200px;margin:0 auto;padding:28px 24px 24px}.topbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:30px}.brand{display:flex;align-items:center;gap:12px}.brand-icon{width:45px;height:45px;display:grid;place-items:center;border-radius:14px;background:#b7f36b;color:#0c1407;font-size:27px;font-weight:700}.eyebrow{font-size:10px;letter-spacing:2px;color:#9bb1ce;font-weight:700;margin:0 0 7px}.brand h1{font:600 20px 'Space Grotesk';margin:0}.live-pill{border:1px solid #2c3d53;background:#101b2b;border-radius:99px;padding:9px 13px;color:#bdcce0;font-size:12px}.live-pill span{display:inline-block;width:7px;height:7px;background:#b7f36b;border-radius:50%;margin-right:8px;box-shadow:0 0 10px #b7f36b}
+.hero{display:flex;justify-content:space-between;align-items:center;padding:32px 34px;border:1px solid #283b52;border-radius:24px;background:linear-gradient(120deg,rgba(21,38,61,.96),rgba(15,25,41,.8));margin-bottom:20px;overflow:hidden}.hero h2{font:600 clamp(30px,4vw,46px)/1.1 'Space Grotesk';letter-spacing:-1.7px;margin:0 0 14px}.hero h2 span{color:#b7f36b}.muted{color:#8fa2bd;font-size:13px;line-height:1.6}.hero-mark{font-size:90px;filter:grayscale(.15);opacity:.9;padding:0 30px}
+.panel{border:1px solid #26374d;border-radius:20px;padding:24px;background:rgba(13,23,38,.88);box-shadow:0 12px 40px #00000015}.section-heading{display:flex;justify-content:space-between;align-items:center;gap:16px}.section-heading h3,.panel h3{font:600 21px 'Space Grotesk';margin:0 0 17px}.section-heading .eyebrow{margin-bottom:6px}.secondary{background:#1b2b40;color:#d9e6f7;border:1px solid #30445e}
+.form-row{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin:14px 0 20px}.form-row label{display:flex;flex-direction:column;gap:7px;color:#9bb0ca;font-size:12px;flex:1;min-width:120px}.form-row input{width:100%;background:#0a1422;border:1px solid #30445c;border-radius:10px;padding:12px;color:#f0f5ff;outline:none}.form-row input:focus{border-color:#b7f36b}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:16px 0}.stat{padding:14px 16px;border-radius:13px;background:#101d2e;border:1px solid #233750;display:flex;flex-direction:column;gap:8px}.stat span,.detail-grid span,.prediction span{font-size:11px;color:#8ea4c0}.stat strong{font:600 25px 'Space Grotesk';color:#dff8c2}.stat .small-strong{font-size:14px;color:#e4edf8}.notice,.error{padding:11px 13px;border-radius:10px;font-size:12px}.notice{background:#2b291b;color:#e9d9a1}.error{background:#351e28;color:#ffb8c7}
+.train-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}.train-card{padding:16px;border-radius:15px;background:#101b2b;border:1px solid #293d55;min-width:0}.train-card-top{display:flex;justify-content:space-between;align-items:center}.train-symbol{font-size:22px}.badge{font-size:10px;color:#c5f58e;background:#23341e;border-radius:99px;padding:5px 8px;max-width:65%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.train-card h4{font:600 16px 'Space Grotesk';margin:14px 0 3px;overflow-wrap:anywhere}.train-card p{margin:0 0 14px}.train-meta{display:flex;justify-content:space-between;gap:8px;padding-top:10px;margin-top:8px;border-top:1px solid #24354a;font-size:11px;color:#91a6c1}.train-meta strong{color:#e8eef8;text-align:right;overflow-wrap:anywhere}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px}.two-col .panel{min-width:0}.train-search{margin-bottom:10px}.intel{margin-top:20px;padding-top:18px;border-top:1px solid #26374d}.intel h4{font:600 18px 'Space Grotesk';margin:0}.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:18px 0}.detail-grid>div{display:flex;flex-direction:column;gap:7px;padding:12px;background:#101d2e;border-radius:11px;min-width:0}.detail-grid strong{font-size:12px;overflow-wrap:anywhere}.prediction{padding:15px;border:1px solid #526b39;background:#172515;border-radius:12px;display:flex;flex-direction:column;gap:7px}.prediction strong{font:600 24px 'Space Grotesk';color:#c9f69e}.prediction small{font-size:11px;line-height:1.5;color:#a5b99a}.helper{margin-top:30px}.history-list{margin-top:18px}.history-row{display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid #26374d;align-items:center}.history-row>div{display:flex;flex-direction:column;gap:5px;min-width:0}.history-row strong{font-size:12px;overflow-wrap:anywhere}.history-row small{font-size:10px;color:#8197b3}.history-row>span{font-size:12px;color:#c8f39e;white-space:nowrap}.empty{grid-column:1/-1;padding:26px;text-align:center;color:#8fa2bd;border:1px dashed #30445c;border-radius:13px;font-size:12px}.empty strong{color:#e3ecf8}.empty p{margin-bottom:0;line-height:1.6}.compact{padding:18px}footer{text-align:center;padding:26px 10px 0;font-size:11px;color:#657b97}
+@media(max-width:760px){.shell{padding:18px 14px}.hero{padding:25px 22px}.hero-mark{font-size:55px;padding:0 0 0 10px}.train-grid{grid-template-columns:1fr 1fr}.two-col{grid-template-columns:1fr}.stats{grid-template-columns:1fr}.stat{flex-direction:row;align-items:center;justify-content:space-between}.topbar{align-items:flex-start}.live-pill{font-size:10px}.hero h2{font-size:31px}}
+@media(max-width:460px){.train-grid{grid-template-columns:1fr}.hero-mark{display:none}.brand h1{font-size:17px}.form-row button{width:100%}.detail-grid{grid-template-columns:1fr}}
